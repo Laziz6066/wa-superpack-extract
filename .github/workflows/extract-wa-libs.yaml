@@ -1,0 +1,123 @@
+name: Extract WhatsApp native libs (superpack)
+run-name: Extract WA libs - ${{ inputs.run_name }}
+
+# Runs WhatsApp in an arm64 reDroid Android container so libsuperpack decompresses
+# the bundled native libs (librtvip.so etc), then uploads them as an artifact.
+# Uses GitHub's FREE arm64 runner (ubuntu-24.04-arm) so WhatsApp's arm-only libs
+# run natively — no x86 ARM-translation needed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_zip_url:
+        description: 'Direct download URL to a .zip containing the WhatsApp split APKs (base + split_config.arm64_v8a + xhdpi + i18n)'
+        required: true
+        type: string
+      run_name:
+        required: false
+        type: string
+      wait_seconds:
+        description: 'Seconds to let WhatsApp decompress after launch'
+        required: false
+        default: '120'
+        type: string
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y adb wget unzip
+
+      - name: Download & unzip APKs
+        run: |
+          wget -q "${{ inputs.apk_zip_url }}" -O apks.zip
+          mkdir -p apks
+          unzip -o apks.zip -d apks
+          echo "=== APKs found ==="
+          find apks -name '*.apk' -printf '%s\t%p\n'
+
+      - name: Load binder kernel modules
+        run: |
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || sudo modprobe binder || true
+          sudo modprobe ashmem_linux || true
+          lsmod | grep -i binder || echo "(binder module state unknown — reDroid may still work)"
+
+      - name: Start reDroid (arm64, Android 12)
+        run: |
+          mkdir -p data
+          docker run -itd --rm --privileged --pull always \
+            -v "$(pwd)/data:/data" -p 5555:5555 \
+            redroid/redroid:12.0.0-latest
+          echo "waiting for boot..."
+          sleep 40
+
+      - name: Connect ADB + wait for device
+        run: |
+          adb connect localhost:5555
+          for i in $(seq 1 30); do
+            state=$(adb -s localhost:5555 get-state 2>/dev/null || true)
+            echo "attempt $i: state=$state"
+            [ "$state" = "device" ] && break
+            adb connect localhost:5555 >/dev/null 2>&1 || true
+            sleep 4
+          done
+          adb devices -l
+          adb -s localhost:5555 root || true
+          sleep 5
+          adb connect localhost:5555 || true
+          # wait for boot completed
+          for i in $(seq 1 30); do
+            bc=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            echo "boot_completed=$bc"
+            [ "$bc" = "1" ] && break
+            sleep 4
+          done
+
+      - name: Install WhatsApp split APKs
+        run: |
+          mapfile -t APKS < <(find apks -name '*.apk')
+          echo "installing: ${APKS[*]}"
+          adb -s localhost:5555 install-multiple -r --abi arm64-v8a "${APKS[@]}" \
+            || adb -s localhost:5555 install-multiple -r "${APKS[@]}"
+          adb -s localhost:5555 shell pm list packages | grep whatsapp || true
+
+      - name: Launch WhatsApp to trigger superpack decompression
+        run: |
+          adb -s localhost:5555 shell monkey -p com.whatsapp -c android.intent.category.LAUNCHER 1 \
+            || adb -s localhost:5555 shell am start -n com.whatsapp/com.whatsapp.HomeActivity \
+            || adb -s localhost:5555 shell am start -n com.whatsapp/com.whatsapp.Main
+          echo "letting it decompress for ${{ inputs.wait_seconds }}s..."
+          sleep "${{ inputs.wait_seconds }}"
+          echo "=== files dir ==="
+          adb -s localhost:5555 shell ls -laR /data/data/com.whatsapp/files 2>/dev/null | grep -iE 'decompress|\.so|spk|spo' | head -40 || true
+
+      - name: Stop container & fix perms
+        if: always()
+        run: |
+          docker stop $(docker ps -q) || true
+          sudo chown -R runner:runner data || true
+
+      - name: Collect decompressed .so files
+        if: always()
+        run: |
+          mkdir -p out
+          echo "=== all .so under com.whatsapp data ==="
+          find data -path '*com.whatsapp*' -name '*.so' -printf '%s\t%p\n' | sort -rn | tee out/so-inventory.txt
+          # copy every decompressed .so (dedupe by name, keep largest)
+          find data -path '*com.whatsapp*' -name '*.so' -exec cp -v {} out/ \; 2>/dev/null || true
+          # safety tarball of the whole whatsapp data tree
+          WADIR=$(find data -type d -path '*com.whatsapp' | head -1)
+          [ -n "$WADIR" ] && tar czf out/whatsapp-data.tar.gz -C "$(dirname "$WADIR")" "$(basename "$WADIR")" || true
+          ls -la out
+
+      - name: Upload native libs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whatsapp-native-libs
+          path: out
+          retention-days: 15
